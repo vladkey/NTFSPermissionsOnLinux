@@ -1,1 +1,1 @@
-java -cp .:target/classes -Djava.library.path=. Ntls
+java -cp .:target/classes -Djava.library.path=lib Ntls $*
