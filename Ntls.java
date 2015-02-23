@@ -14,7 +14,7 @@ public static void main(String[] args) throws Exception {
 
  DEBUG = args.length > 1 && "-vvv".equalsIgnoreCase(args[1]) ? 3 : 0;
 
-         File f = new File(fn);
+ File f = new File(fn);
  boolean isDir = f.isDirectory();
  System.out.println((isDir ? "Directory name" : "File name") + ": " + fn);
 
@@ -35,6 +35,8 @@ public static void main(String[] args) throws Exception {
      System.out.println("WARNING: UserMapping file not read: " + e.getMessage());
  }
  acl.print();
+ boolean success = dev.writeAttribute(fn, "wwkxattr", "success".getBytes());
+ System.out.println("writeAttrib: " + success);
 }
 
 public static class NtfsAclAttribute {
