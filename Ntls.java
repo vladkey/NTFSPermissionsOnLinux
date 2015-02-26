@@ -1,5 +1,4 @@
 
-
 import java.io.*;
 import java.util.*;
 
@@ -7,286 +6,405 @@ import wwk.*;
 
 public class Ntls {
 
-public static int DEBUG = 0;
+    public static int DEBUG = 0;
 
-public static void main(String[] args) throws Exception {
- String fn = args.length > 0 ? args[0] : "/mnt/d/Work";
+    public static void main(String[] args) throws Exception {
+        String fn = args.length > 0 ? args[0] : "/mnt/d/Work";
 
- DEBUG = args.length > 1 && "-vvv".equalsIgnoreCase(args[1]) ? 3 : 0;
+        DEBUG = args.length > 1 && "-vvv".equalsIgnoreCase(args[1]) ? 3 : 0;
 
- File f = new File(fn);
- boolean isDir = f.isDirectory();
- System.out.println((isDir ? "Directory name" : "File name") + ": " + fn);
+        boolean isDir = new File(fn).isDirectory();
+        System.out.println((isDir ? "Directory name" : "File name") + ": " + fn);
 
+        Xattrj dev = new Xattrj();
+        String[] a = dev.listAttributes(fn);
+        if (a != null) {
+            System.out.println("Total attrs: " + a.length);
+            for (String an : a)
+                System.out.println(an);
+        } else
+            System.out.println("listAttributes is null, IMPLEMENT");
 
- Xattrj dev = new Xattrj();
- String[] a = dev.listAttributes(fn);
- if (a != null) {
-     System.out.println("Total attrs: " + a.length);
-    for (String an : a)
-       System.out.println(an);
- } else System.out.println("listAttributes is null, IMPLEMENT");
+        byte[] aclBytes = dev.readAttribute(fn, "system.ntfs_acl");
+        NtfsAclAttribute acl = new NtfsAclAttribute(aclBytes, isDir);
+        try {
+            readUserMappingFile();
+        } catch (IOException e) {
+            System.out.println("WARNING: UserMapping file not read: " + e.getMessage());
+        }
+        acl.print();
 
- byte[] aclBytes = dev.readAttribute(fn, "system.ntfs_acl");
- NtfsAclAttribute acl = new NtfsAclAttribute(aclBytes, isDir);
- try {
-     readUserMappingFile();
- } catch (IOException e) {
-     System.out.println("WARNING: UserMapping file not read: " + e.getMessage());
- }
- acl.print();
- boolean success = dev.writeAttribute(fn, "wwkxattr", "success".getBytes());
- System.out.println("writeAttrib: " + success);
-}
+        boolean success = dev.writeAttribute(fn, "wwkxattr", "success".getBytes());
+        System.out.println("attribute written? " + success);
 
-public static class NtfsAclAttribute {
-    public int revision;
-    public int flags;
-    public int offUSID;
-    public int offGSID;
-    public int offSACL;
-    public int offDACL;
-    public String ownerSID;
-    public String groupSID;
-    public AceList dacl;
-    public AceList sacl;
+        byte[] written = acl.write();
+        if (written.length != aclBytes.length) {
+            System.out.println(String.format("ERROR: re-created is %d bytes, expected %d", written.length, aclBytes.length));
+        }
+        if (!Arrays.equals(written, aclBytes)) {
+            System.out.println("ERROR: re-created with data difference!");
+            System.out.println("Original:" + byteArrayToHex(aclBytes));
+            System.out.println("Re-created:" + byteArrayToHex(written));
+        }
+    } // main
 
- public void print() {
-     if (DEBUG > 2) System.out.println("ACL revision: \t" + revision);
-     System.out.println("ACL flags: \t" + hex(flags) + ": " + SECURITY_DESCRIPTOR_CONTROL.decode(flags));
-     if (DEBUG > 2) {
-         System.out.println("\t Off USID: " + hex(offUSID));
-         System.out.println("\t Off GSID: " + hex(offGSID));
-         System.out.println("\t Off SACL: " + hex(offSACL));
-         System.out.println("\t Off DACL: " + hex(offDACL));
+    public static class NtfsAclAttribute {
+        public int revision;
+        public int flags;
+        public String ownerSID;
+        public String groupSID;
+        public AceList dacl;
+        public AceList sacl;
+
+        private int offUSID;
+        private int offGSID;
+        private int offSACL;
+        private int offDACL;
+
+        public NtfsAclAttribute(byte[] acl, boolean isDir) throws IOException {
+            MyDataInputStream is = new MyDataInputStream(new ByteArrayInputStream(acl));
+            revision = is.readUnsignedShortBE();
+            flags = is.readUnsignedShortBE();
+            offUSID = is.readIntBE();
+            offGSID = is.readIntBE();
+            offSACL = is.readIntBE();
+            offDACL = is.readIntBE();
+
+            is.seek(offUSID);
+            ownerSID = readSID(is);
+            is.seek(offGSID);
+            groupSID = readSID(is);
+
+            if (offDACL > 0) {
+                is.seek(offDACL);
+                dacl = new AceList(isDir);
+                dacl.read(is);
+            }
+            if (offSACL > 0) {
+                is.seek(offSACL);
+                sacl = new AceList(isDir);
+                sacl.read(is);
+            }
+        }
+
+        public byte[] write() throws IOException {
+            MyByteArrayOutputStream baos = new MyByteArrayOutputStream();
+            DataOutputStream out = new DataOutputStream(baos);
+
+            out.writeShort(revision);
+            out.writeShort(flags);
+            for (int i = 0; i < 4; i++)
+                out.writeInt(0xDEADBEEF);
+
+            int offSACLOut = 0;
+            if (sacl != null) {
+                offSACLOut = baos.size();
+                sacl.write(out);
+            }
+
+            int offDACLOut = 0;
+            if (dacl != null) {
+                offDACLOut = baos.size();
+                dacl.write(out);
+            }
+
+            int offUserSID = baos.size();
+            writeSID(ownerSID, out);
+            int offGroupSID = baos.size();
+            writeSID(groupSID, out);
+
+            writeOffset(out, baos, 4, offUserSID);
+            writeOffset(out, baos, 8, offGroupSID);
+            writeOffset(out, baos, 12, offDACLOut);
+            writeOffset(out, baos, 16, offSACLOut);
+
+            return baos.toByteArray();
+        }
+
+        private void writeOffset(DataOutputStream out, MyByteArrayOutputStream baos, int offset, int value) throws IOException {
+            int totalSize = baos.seek(offset);
+            out.writeInt(value);
+            baos.restore(totalSize);
+        }
+
+        public void print() {
+            if (DEBUG > 2)
+                System.out.println("ACL revision: \t" + revision);
+            System.out.println("ACL flags: \t" + hex(flags) + ": " + SECURITY_DESCRIPTOR_CONTROL.decode(flags));
+            if (DEBUG > 2) {
+                System.out.println("\t Off USID: " + hex(offUSID));
+                System.out.println("\t Off GSID: " + hex(offGSID));
+                System.out.println("\t Off SACL: " + hex(offSACL));
+                System.out.println("\t Off DACL: " + hex(offDACL));
+            }
+            System.out.println("Owner SID: " + decode(ownerSID));
+            System.out.println("Owner GID: " + decode(groupSID));
+            if (dacl != null) {
+                if (DEBUG > 2)
+                    System.out.println("DACL");
+                dacl.print();
+            }
+            if (sacl != null) {
+                if (DEBUG > 2)
+                    System.out.println("SACL");
+                sacl.print();
+            }
+        }
+
+        public static class AceList {
+            boolean isDir;
+
+            int revision;
+            int aclSize;
+            int aclEntryCount;
+            List<Ace> aceList = new ArrayList<>();
+
+            public AceList(boolean isDir) {
+                this.isDir = isDir;
+            }
+
+            public void read(MyDataInputStream is) throws IOException {
+                revision = is.readUnsignedByte();
+                is.readUnsignedByte(); // alignment1
+                aclSize = is.readUnsignedShortBE();
+                aclEntryCount = is.readUnsignedShortBE();
+                is.readUnsignedShort(); // alignment2
+                for (int i = 0; i < aclEntryCount; i++) {
+                    Ace ace = new Ace(isDir);
+                    ace.read(is);
+                    aceList.add(ace);
+                }
+            }
+
+            public void print() {
+                if (DEBUG > 2) {
+                    System.out.println("\t revision: \t" + revision);
+                    System.out.println("\t ACL size: " + aclSize);
+                    System.out.println("\t ACE cnt: " + aclEntryCount);
+                }
+                for (int i = 0; i < aclEntryCount; i++) {
+                    if (DEBUG > 2)
+                        System.out.println("\t ACE  " + (i + 1));
+                    Ace ace = aceList.get(i);
+                    ace.print();
+                }
+            }
+
+            public void write(DataOutputStream out) throws IOException {
+                out.writeByte(revision);
+                out.writeByte(0);
+                out.writeShort(aclSize);
+                out.writeShort(aclEntryCount);
+                out.writeShort(0);
+                for (int i = 0; i < aceList.size(); i++)
+                    aceList.get(i).write(out);
+            }
+
+        } // class AceList
+
+        public static class Ace {
+            int objectType;
+
+            int aceType;
+            int aceFlags;
+            int aceSize;
+            int aceRights;
+            String sid;
+
+            public Ace(boolean isDir) {
+                this.objectType = isDir ? ACCESS_MASK_DEST.DIR : ACCESS_MASK_DEST.FILE;
+            }
+
+            public void read(MyDataInputStream is) throws IOException {
+                aceType = is.readUnsignedByte();
+                aceFlags = is.readUnsignedByte();
+                aceSize = is.readUnsignedShortBE();
+                aceRights = is.readIntBE();
+                sid = readSID(is);
+            }
+
+            public void print() {
+                if (DEBUG > 2) {
+                    printDebug();
+                } else {
+                    printNormal();
+                }
+            }
+
+            public void printDebug() {
+                System.out.println("\t\t type: " + decodeType(aceType));
+                System.out.println("\t\t flags: " + hex(aceFlags) + ": " + ACE_FLAGS.decode(aceFlags));
+                System.out.println("\t\t size: " + hex(aceSize));
+                System.out.println("\t\t Access rights: " + hex(aceRights) + ": "
+                        + ACCESS_MASK.decode(aceRights, objectType));
+                System.out.println("\t\t SID: " + decode(sid));
+            }
+
+            public void printNormal() {
+                System.out.println(" " + decode(sid) + ": " + decodeType(aceType) + " " +
+                        ACCESS_MASK.decode(aceRights, objectType) + " * " + ACE_FLAGS.decode(aceFlags));
+            }
+
+            public static String decodeType(int aceType) {
+                return aceType == 0 ? "Allow" : aceType == 1 ? "Deny" : "??? " + aceType;
+            }
+
+            public void write(DataOutputStream out) throws IOException {
+                out.writeByte(aceType);
+                out.writeByte(aceFlags);
+                out.writeShort(aceSize);
+                out.writeInt(aceRights);
+                writeSID(sid, out);
+            }
+
+        } // class Ace
+
+        private static String readSID(MyDataInputStream is) throws IOException {
+            int revision = is.readUnsignedByte();
+            String result = "S-" + revision;
+            int sub_authority_count = is.readUnsignedByte();
+            int auth_high = is.readUnsignedShort();
+            int auth_low = is.readInt();
+            long authority = auth_low << 32 | auth_high;
+            result += "-" + authority;
+            for (int i = 0; i < sub_authority_count; i++) {
+                int subAuthPart = is.readIntBE();
+                result += "-" + subAuthPart; // Integer.toHexString(subAuthPart);
+            }
+            return result;
+        }
+
+        public static void writeSID(String sid, DataOutputStream out) throws IOException {
+            String[] parts = sid.split("-");
+            int sidrev = Integer.parseInt(parts[1]);
+            out.writeByte(sidrev);
+            int sub_authority_count = parts.length - 3;
+            out.writeByte(sub_authority_count);
+
+            long authority = Long.parseLong(parts[2]);
+            out.writeShort((int)authority & 0xFFFF);
+            out.writeInt((int)authority >> 32);
+
+            for (int i = 0; i < sub_authority_count; i++) {
+                int subAuthPart = Integer.parseInt(parts[i+3]);
+                out.writeInt(subAuthPart);
+            }
+        }
+
+        static String hex(int v) {
+            return "0x" + Integer.toHexString(v);
+        }
+    } // NtfsAclAttribute
+
+    public static String decode(String sid) {
+        String result = WELL_KNOWN_SIDs.get(sid);
+        if (result == null)
+            result = UserMapping.get(sid);
+        if (result == null)
+            result = sid;
+        return result;
+    }
+
+    static void readUserMappingFile() throws IOException {
+        try (LineNumberReader r = new LineNumberReader(new InputStreamReader(new FileInputStream("UserMapping")))) {
+            while (true) {
+                String l = r.readLine();
+                if (l == null)
+                    break;
+                if (l.trim().startsWith("#"))
+                    continue;
+                String parts[] = l.trim().split(":");
+                String username = parts[0], groupname = parts[1], sid = parts[2];
+                if (username.isEmpty()) {
+                    UserMapping.put(sid, "Group " + groupname);
+                } else if (groupname.isEmpty()) {
+                    UserMapping.put(sid, "User " + username);
+                } else {
+                    UserMapping.put(sid, "User " + username + " (group " + groupname + ")");
+                }
+            }
+        }
+    }
+
+    static final Map<String, String> UserMapping = new HashMap<>();
+
+    static final Map<String, String> WELL_KNOWN_SIDs = new HashMap<>();
+    static {
+        /* Users. */
+        WELL_KNOWN_SIDs.put("S-1-5-21-*-*-*-500", "Built-In Administrators"); // "DOMAIN_USER_RID_ADMIN", "0x1f4");
+        WELL_KNOWN_SIDs.put("S-1-5-21-*-*-*-501", "Built-In Guests"); // "DOMAIN_USER_RID_GUEST", "0x1f5");
+        WELL_KNOWN_SIDs.put("S-1-5-21-*-*-*-502", "Built-In KRBTGT"); // "DOMAIN_USER_RID_KRBTGT", "0x1f6");
+
+        /* Groups. */
+        WELL_KNOWN_SIDs.put("S-1-5-32-512", "Domain Administrators"); // "DOMAIN_GROUP_RID_ADMINS", "0x200");
+        WELL_KNOWN_SIDs.put("S-1-5-32-513", "Domain Users"); // "DOMAIN_GROUP_RID_USERS", "0x201");
+        WELL_KNOWN_SIDs.put("S-1-5-32-514", "Domain Guests"); // "DOMAIN_GROUP_RID_GUESTS", "0x202");
+        WELL_KNOWN_SIDs.put("S-1-5-32-515", "Domain Computers"); // "DOMAIN_GROUP_RID_COMPUTERS", "0x203");
+        WELL_KNOWN_SIDs.put("S-1-5-32-516", "Domain Controllers"); // "DOMAIN_GROUP_RID_CONTROLLERS", "0x204");
+
+        WELL_KNOWN_SIDs.put("S-1-5-32-517", "Domain Cert Admins"); // "DOMAIN_GROUP_RID_CERT_ADMINS", "0x205");
+        WELL_KNOWN_SIDs.put("S-1-5-32-518", "Domain Schema Admins"); // "DOMAIN_GROUP_RID_SCHEMA_ADMINS", "0x206");
+        WELL_KNOWN_SIDs.put("S-1-5-32-519", "Enterprise Admins"); // "DOMAIN_GROUP_RID_ENTERPRISE_ADMINS", "0x207");
+        WELL_KNOWN_SIDs.put("S-1-5-32-520", "Policy Admins"); // "DOMAIN_GROUP_RID_POLICY_ADMINS", "0x208");
+
+        /* Aliases. */
+        WELL_KNOWN_SIDs.put("S-1-5-32-544", "Local Administrators"); // "DOMAIN_ALIAS_RID_ADMINS", "0x220");
+        WELL_KNOWN_SIDs.put("S-1-5-32-545", "Local Users"); // "DOMAIN_ALIAS_RID_USERS", "0x221");
+        WELL_KNOWN_SIDs.put("S-1-5-32-546", "Local Guests"); // "DOMAIN_ALIAS_RID_GUESTS", "0x222");
+        WELL_KNOWN_SIDs.put("S-1-5-32-547", "Local Power Users"); // "DOMAIN_ALIAS_RID_POWER_USERS", "0x223");
+
+        WELL_KNOWN_SIDs.put("S-1-5-32-548", "Account  Operators"); // "DOMAIN_ALIAS_RID_ACCOUNT_OPS", "0x224");
+        WELL_KNOWN_SIDs.put("S-1-5-32-549", "System Operators"); // "DOMAIN_ALIAS_RID_SYSTEM_OPS", "0x225");
+        WELL_KNOWN_SIDs.put("S-1-5-32-550", "Print Operators"); // "DOMAIN_ALIAS_RID_PRINT_OPS", "0x226");
+        WELL_KNOWN_SIDs.put("S-1-5-32-551", "Backup Operators"); // "DOMAIN_ALIAS_RID_BACKUP_OPS", "0x227");
+
+        WELL_KNOWN_SIDs.put("S-1-5-32-546", "Replicators"); // "DOMAIN_ALIAS_RID_REPLICATOR", "0x228");
+        WELL_KNOWN_SIDs.put("S-1-5-32-546", "RAS Servers"); // "DOMAIN_ALIAS_RID_RAS_SERVERS", "0x229");
+
+        WELL_KNOWN_SIDs.put("S-1-1-0", "WORLD_SID");
+        WELL_KNOWN_SIDs.put("S-1-2-0", "LOCAL_SID");
+        WELL_KNOWN_SIDs.put("S-1-3-0", "CREATOR_OWNER_SID");
+        WELL_KNOWN_SIDs.put("S-1-3-1", "CREATOR_GROUP_SID");
+        WELL_KNOWN_SIDs.put("S-1-3-2", "CREATOR_OWNER_SERVER_SID");
+        WELL_KNOWN_SIDs.put("S-1-3-3", "CREATOR_GROUP_SERVER_SID");
+
+        WELL_KNOWN_SIDs.put("S-1-5-2", "NETWORK_SID");
+        WELL_KNOWN_SIDs.put("S-1-5-3", "BATCH_SID");
+        WELL_KNOWN_SIDs.put("S-1-5-4", "INTERACTIVE_SID");
+        WELL_KNOWN_SIDs.put("S-1-5-6", "SERVICE_SID");
+        WELL_KNOWN_SIDs.put("S-1-5-7", "ANONYMOUS_LOGON_SID");// (aka null logon session)
+        WELL_KNOWN_SIDs.put("S-1-5-8", "PROXY_SID");
+        WELL_KNOWN_SIDs.put("S-1-5-9", "SERVER_LOGON_SID");// (aka domain controller account)
+        WELL_KNOWN_SIDs.put("S-1-5-10", "SELF_SID");// (self RID)
+        WELL_KNOWN_SIDs.put("S-1-5-11", "AUTHENTICATED_USER_SID");
+        WELL_KNOWN_SIDs.put("S-1-5-12", "RESTRICTED_CODE_SID");// (running restricted code)
+        WELL_KNOWN_SIDs.put("S-1-5-13", "TERMINAL_SERVER_SID");// (running on terminal server)
+
+        /*
+         * (Logon IDs) S-1-5-5-X-Y
+         *
+         * (NT non-unique IDs) S-1-5-0x15-...
+         *
+         * (Built-in domain) S-1-5-0x20
+         */
+
+        WELL_KNOWN_SIDs.put("S-1-5-18", "NT System");
+    } // static
+
+    public static String byteArrayToHex(byte[] a) {
+        StringBuilder sb = new StringBuilder(a.length * 3 / 2);
+        for(int pos = 0; pos < a.length; pos++) {
+            byte b = a[pos];
+            if (pos % 16 == 0)
+                sb.append(String.format("\n%4x:", pos));
+            if (pos % 4 == 0)
+                sb.append(' ');
+            sb.append(String.format("%02x", b & 0xff));
+        }
+        return sb.toString();
      }
-     System.out.println("Owner SID: " + decode(ownerSID));
-     System.out.println("Owner GID: " + decode(groupSID));
-     if (dacl != null) {
-         if (DEBUG > 2) System.out.println("DACL");
-         dacl.print();
-     }
-     if (sacl != null) {
-         if (DEBUG > 2) System.out.println("SACL");
-         sacl.print();
-     }
- }
-
- public NtfsAclAttribute(byte[] acl, boolean isDir) throws IOException {
-     MyDataInputStream is = new MyDataInputStream(new ByteArrayInputStream(acl));
-     revision = is.readUnsignedShortBE();
-     flags = is.readUnsignedShortBE();
-     offUSID = is.readIntBE();
-     offGSID = is.readIntBE();
-     offSACL = is.readIntBE();
-     offDACL = is.readIntBE();
-
-     is.seek(offUSID);
-     ownerSID = readSID(is);
-     is.seek(offGSID);
-     groupSID = readSID(is);
-
-     if (offDACL > 0) {
-         is.seek(offDACL);
-         dacl = new AceList(is, isDir);
-     }
-     if (offSACL > 0) {
-         is.seek(offSACL);
-         sacl = new AceList(is, isDir);
-     }
- }
-
- public static class AceList {
-     int revision;
-     int aclSize;
-     int aclEntryCount;
-     List<Ace> aceList = new ArrayList<>();
-
-     public AceList(MyDataInputStream is, boolean isDir) throws IOException {
-         revision = is.readUnsignedByte();
-         is.readUnsignedByte(); // alignment1
-         aclSize = is.readUnsignedShortBE();
-         aclEntryCount = is.readUnsignedShortBE();
-         is.readUnsignedShort(); // alignment2
-         for (int i = 0; i < aclEntryCount; i++) {
-             Ace ace = new Ace(is, isDir);
-             aceList.add(ace);
-         }
-     }
-
-     public void print() {
-         if (DEBUG > 2) {
-             System.out.println("\t revision: \t" + revision);
-             System.out.println("\t ACL size: " + aclSize);
-             System.out.println("\t ACE cnt: " + aclEntryCount);
-         }
-         for (int i = 0; i < aclEntryCount; i++) {
-             if (DEBUG > 2) System.out.println("\t ACE  " + (i+1));
-             Ace ace = aceList.get(i);
-             ace.print();
-         }
-     }
- } // class AceList
-
- public static class Ace {
-     int aceType;
-     int aceFlags;
-     int aceSize;
-     int aceRights;
-     String sid;
-     int objectType;
-
-     public Ace(MyDataInputStream is, boolean isDir) throws IOException {
-         this.objectType = isDir ? ACCESS_MASK_DEST.DIR : ACCESS_MASK_DEST.FILE;
-         aceType = is.readUnsignedByte();
-         aceFlags = is.readUnsignedByte();
-         aceSize = is.readUnsignedShortBE();
-         aceRights = is.readIntBE();
-         sid = readSID(is);
-     }
-
-     public void print() {
-         if (DEBUG > 2) {
-             printDebug();
-         } else {
-             printNormal();
-         }
-     }
-
-     public void printDebug() {
-        System.out.println("\t\t type: " + decodeType(aceType));
-        System.out.println("\t\t flags: " + hex(aceFlags) + ": "  + ACE_FLAGS.decode(aceFlags));
-        System.out.println("\t\t size: " + hex(aceSize));
-        System.out.println("\t\t Access rights: " + hex(aceRights) + ": " + ACCESS_MASK.decode(aceRights, objectType));
-        System.out.println("\t\t SID: " + decode(sid));
-     }
-
-     public void printNormal() {
-         System.out.println(" " + decode(sid) + ": " + decodeType(aceType) + " " +
-             ACCESS_MASK.decode(aceRights, objectType) + " * " + ACE_FLAGS.decode(aceFlags));
-      }
-
-     public static String decodeType(int aceType) {
-        return aceType == 0 ? "Allow" : aceType == 1 ? "Deny" : "??? " + aceType;
-     }
- }  // class Ace
-
- private static String readSID(MyDataInputStream is) throws IOException {
-     int revision = is.readUnsignedByte();
-     String result = "S-" + revision;
-     int sub_authority_count = is.readUnsignedByte();
-     int auth_high = is.readUnsignedShort();
-     int auth_low = is.readInt();
-     long authority = auth_low << 32 | auth_high;
-     result += "-" + authority;
-     for (int i = 0; i < sub_authority_count; i++) {
-         int subAuthPart = is.readIntBE();
-         result += "-" + subAuthPart; // Integer.toHexString(subAuthPart);
-     }
-     return result;
-}
-
- static String hex(int v) {
-     return "0x" + Integer.toHexString(v);
- }
-} // NtfsAclAttribute
-
-
- public static String decode(String sid) {
-    String result = WELL_KNOWN_SIDs.get(sid);
-    if(result == null)
-        result = UserMapping.get(sid);
-    if(result == null)
-        result = sid;
-    return result;
- }
-
- static void readUserMappingFile() throws IOException {
-     try (LineNumberReader r = new LineNumberReader(new InputStreamReader(new FileInputStream("UserMapping")))) {
-         while (true) {
-             String l = r.readLine();
-             if (l == null)
-                 break;
-             if (l.trim().startsWith("#"))
-                 continue;
-             String parts[] = l.trim().split(":");
-             String username = parts[0], groupname = parts[1], sid = parts[2];
-             if (username.isEmpty()) {
-                 UserMapping.put(sid, "Group " + groupname);
-             } else if (groupname.isEmpty()) {
-                 UserMapping.put(sid, "User " + username);
-             } else {
-                 UserMapping.put(sid, "User " + username + " (group " + groupname + ")");
-             }
-         }
-     }
- }
- static final Map<String, String> UserMapping = new HashMap<>();
-
- static final Map<String, String> WELL_KNOWN_SIDs = new HashMap<>();
- static {
-    /* Users. */
-    WELL_KNOWN_SIDs.put("S-1-5-21-*-*-*-500", "Built-In Administrators"); // "DOMAIN_USER_RID_ADMIN", "0x1f4");
-    WELL_KNOWN_SIDs.put("S-1-5-21-*-*-*-501", "Built-In Guests"); // "DOMAIN_USER_RID_GUEST", "0x1f5");
-    WELL_KNOWN_SIDs.put("S-1-5-21-*-*-*-502", "Built-In KRBTGT"); // "DOMAIN_USER_RID_KRBTGT", "0x1f6");
-
-    /* Groups. */
-    WELL_KNOWN_SIDs.put("S-1-5-32-512", "Domain Administrators"); // "DOMAIN_GROUP_RID_ADMINS", "0x200");
-    WELL_KNOWN_SIDs.put("S-1-5-32-513", "Domain Users"); // "DOMAIN_GROUP_RID_USERS", "0x201");
-    WELL_KNOWN_SIDs.put("S-1-5-32-514", "Domain Guests"); // "DOMAIN_GROUP_RID_GUESTS", "0x202");
-    WELL_KNOWN_SIDs.put("S-1-5-32-515", "Domain Computers"); // "DOMAIN_GROUP_RID_COMPUTERS", "0x203");
-    WELL_KNOWN_SIDs.put("S-1-5-32-516", "Domain Controllers"); // "DOMAIN_GROUP_RID_CONTROLLERS", "0x204");
-
-    WELL_KNOWN_SIDs.put("S-1-5-32-517", "Domain Cert Admins"); // "DOMAIN_GROUP_RID_CERT_ADMINS", "0x205");
-    WELL_KNOWN_SIDs.put("S-1-5-32-518", "Domain Schema Admins"); // "DOMAIN_GROUP_RID_SCHEMA_ADMINS", "0x206");
-    WELL_KNOWN_SIDs.put("S-1-5-32-519", "Enterprise Admins"); // "DOMAIN_GROUP_RID_ENTERPRISE_ADMINS", "0x207");
-    WELL_KNOWN_SIDs.put("S-1-5-32-520", "Policy Admins"); // "DOMAIN_GROUP_RID_POLICY_ADMINS", "0x208");
-
-    /* Aliases. */
-    WELL_KNOWN_SIDs.put("S-1-5-32-544", "Local Administrators"); // "DOMAIN_ALIAS_RID_ADMINS", "0x220");
-    WELL_KNOWN_SIDs.put("S-1-5-32-545", "Local Users"); // "DOMAIN_ALIAS_RID_USERS", "0x221");
-    WELL_KNOWN_SIDs.put("S-1-5-32-546", "Local Guests"); // "DOMAIN_ALIAS_RID_GUESTS", "0x222");
-    WELL_KNOWN_SIDs.put("S-1-5-32-547", "Local Power Users"); // "DOMAIN_ALIAS_RID_POWER_USERS", "0x223");
-
-    WELL_KNOWN_SIDs.put("S-1-5-32-548", "Account  Operators"); // "DOMAIN_ALIAS_RID_ACCOUNT_OPS", "0x224");
-    WELL_KNOWN_SIDs.put("S-1-5-32-549", "System Operators"); // "DOMAIN_ALIAS_RID_SYSTEM_OPS", "0x225");
-    WELL_KNOWN_SIDs.put("S-1-5-32-550", "Print Operators"); // "DOMAIN_ALIAS_RID_PRINT_OPS", "0x226");
-    WELL_KNOWN_SIDs.put("S-1-5-32-551", "Backup Operators"); // "DOMAIN_ALIAS_RID_BACKUP_OPS", "0x227");
-
-    WELL_KNOWN_SIDs.put("S-1-5-32-546", "Replicators"); // "DOMAIN_ALIAS_RID_REPLICATOR", "0x228");
-    WELL_KNOWN_SIDs.put("S-1-5-32-546", "RAS Servers"); // "DOMAIN_ALIAS_RID_RAS_SERVERS", "0x229");
-
-    WELL_KNOWN_SIDs.put("S-1-1-0", "WORLD_SID");
-    WELL_KNOWN_SIDs.put("S-1-2-0", "LOCAL_SID");
-    WELL_KNOWN_SIDs.put("S-1-3-0", "CREATOR_OWNER_SID");
-    WELL_KNOWN_SIDs.put("S-1-3-1", "CREATOR_GROUP_SID");
-    WELL_KNOWN_SIDs.put("S-1-3-2", "CREATOR_OWNER_SERVER_SID");
-    WELL_KNOWN_SIDs.put("S-1-3-3", "CREATOR_GROUP_SERVER_SID");
-
-    WELL_KNOWN_SIDs.put("S-1-5-2", "NETWORK_SID");
-    WELL_KNOWN_SIDs.put("S-1-5-3", "BATCH_SID");
-    WELL_KNOWN_SIDs.put("S-1-5-4", "INTERACTIVE_SID");
-    WELL_KNOWN_SIDs.put("S-1-5-6", "SERVICE_SID");
-    WELL_KNOWN_SIDs.put("S-1-5-7", "ANONYMOUS_LOGON_SID");// (aka null logon session)
-    WELL_KNOWN_SIDs.put("S-1-5-8", "PROXY_SID");
-    WELL_KNOWN_SIDs.put("S-1-5-9", "SERVER_LOGON_SID");//     (aka domain controller account)
-    WELL_KNOWN_SIDs.put("S-1-5-10", "SELF_SID");//    (self RID)
-    WELL_KNOWN_SIDs.put("S-1-5-11", "AUTHENTICATED_USER_SID");
-    WELL_KNOWN_SIDs.put("S-1-5-12", "RESTRICTED_CODE_SID");//    (running restricted code)
-    WELL_KNOWN_SIDs.put("S-1-5-13", "TERMINAL_SERVER_SID");//    (running on terminal server)
-
-    /*
-    *  (Logon IDs)     S-1-5-5-X-Y
-    *
-    *  (NT non-unique IDs) S-1-5-0x15-...
-    *
-    *  (Built-in domain)   S-1-5-0x20
-    */
-
-    WELL_KNOWN_SIDs.put("S-1-5-18", "NT System");
- } // static
-
 } // class Ntls
+
 
 class MyDataInputStream extends DataInputStream {
 
@@ -315,6 +433,17 @@ class MyDataInputStream extends DataInputStream {
     }
 } // class MyDataInputStream
 
+class MyByteArrayOutputStream extends ByteArrayOutputStream {
+    public int seek(int newOffset) {
+        int oldSize = count;
+        count = newOffset;
+        return oldSize;
+    }
+    public void restore(int count) {
+        this.count = count;
+    }
+}
+
 enum ACE_FLAGS {
     OBJECT_INHERIT_ACE(0x01),
     CONTAINER_INHERIT_ACE(0x02),
@@ -327,9 +456,11 @@ enum ACE_FLAGS {
     FAILED_ACCESS_ACE_FLAG(0x80);
 
     int mask;
+
     private ACE_FLAGS(int mask) {
         this.mask = mask;
     }
+
     static List<ACE_FLAGS> decode(int flags) {
         List<ACE_FLAGS> result = new ArrayList<>();
         for (ACE_FLAGS s : values()) {
@@ -347,8 +478,10 @@ enum SECURITY_DESCRIPTOR_CONTROL {
     SE_DACL_DEFAULTED(0x0008, "DACL field was provided by a defaulting mechanism"),
     SE_SACL_PRESENT(0x0010, "SACL is present"),
     SE_SACL_DEFAULTED(0x0020, "SACL field was provided by a defaulting mechanism"),
-    SE_DACL_AUTO_INHERIT_REQ(0x0100, "Required DACL is set up for propagation of inheritable ACEs to existing child objects"),
-    SE_SACL_AUTO_INHERIT_REQ(0x0200, "Required SACL is set up for propagation of inheritable ACEs to existing child objects"),
+    SE_DACL_AUTO_INHERIT_REQ(0x0100,
+            "Required DACL is set up for propagation of inheritable ACEs to existing child objects"),
+    SE_SACL_AUTO_INHERIT_REQ(0x0200,
+            "Required SACL is set up for propagation of inheritable ACEs to existing child objects"),
     SE_DACL_AUTO_INHERITED(0x0400, "DACL is set up for propagation of inheritable ACEs to existing child objects"),
     SE_SACL_AUTO_INHERITED(0x0800, "SACL is set up for propagation of inheritable ACEs to existing child objects"),
     SE_DACL_PROTECTED(0x1000, "Prevents ACEs of the parent container DACL from being applied to the object DACL."),
@@ -358,10 +491,12 @@ enum SECURITY_DESCRIPTOR_CONTROL {
 
     int mask;
     String meaning;
+
     SECURITY_DESCRIPTOR_CONTROL(int mask, String meaning) {
         this.mask = mask;
         this.meaning = meaning;
     }
+
     static List<SECURITY_DESCRIPTOR_CONTROL> decode(int flags) {
         List<SECURITY_DESCRIPTOR_CONTROL> result = new ArrayList<>();
         for (SECURITY_DESCRIPTOR_CONTROL s : values()) {
@@ -370,6 +505,7 @@ enum SECURITY_DESCRIPTOR_CONTROL {
         }
         return result;
     }
+
     @Override
     public String toString() {
         return meaning;
@@ -384,8 +520,7 @@ interface ACCESS_MASK_DEST {
 
 enum ACCESS_MASK implements ACCESS_MASK_DEST {
     /*
-     * The specific rights (bits 0 to 15). Depend on the type of the
-     * object being secured by the ACE.
+     * The specific rights (bits 0 to 15). Depend on the type of the object being secured by the ACE.
      */
 
     /* Specific rights for files and directories are as follows: */
@@ -417,8 +552,8 @@ enum ACCESS_MASK implements ACCESS_MASK_DEST {
     FILE_TRAVERSE(0x00000020, "Traverse", DIR),
 
     /*
-     * Right to delete a directory and all the files it contains (its
-     * children), even if the files are read-only. (DIRECTORY)
+     * Right to delete a directory and all the files it contains (its children), even if the files are read-only.
+     * (DIRECTORY)
      */
     FILE_DELETE_CHILD(0x00000040, "Delete child", DIR),
 
@@ -446,13 +581,11 @@ enum ACCESS_MASK implements ACCESS_MASK_DEST {
     SYNCHRONIZE(0x00100000, "SYNC"),
 
     /*
-     * The following STANDARD_RIGHTS_* are combinations of the above for
-     * convenience and are defined by the Win32 API.
+     * The following STANDARD_RIGHTS_* are combinations of the above for convenience and are defined by the Win32 API.
      */
 
     /*
-     * The generic rights (bits 28 to 31). These map onto the standard and
-     * specific rights.
+     * The generic rights (bits 28 to 31). These map onto the standard and specific rights.
      */
 
     /* Read, write, and execute access. */
@@ -462,16 +595,14 @@ enum ACCESS_MASK implements ACCESS_MASK_DEST {
     GENERIC_EXECUTE(0x20000000, "GENERIC_EXECUTE"),
 
     /*
-     * Write access. For files, this maps onto:
-     * FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | FILE_WRITE_EA | STANDARD_RIGHTS_WRITE | SYNCHRONIZE
-     * For directories, the mapping has the same numerical value.
+     * Write access. For files, this maps onto: FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA |
+     * FILE_WRITE_EA | STANDARD_RIGHTS_WRITE | SYNCHRONIZE For directories, the mapping has the same numerical value.
      */
     GENERIC_WRITE(0x40000000, "GENERIC_WRITE"),
 
     /*
-     * Read access. For files, this maps onto:
-     * FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_READ_EA | STANDARD_RIGHTS_READ | SYNCHRONIZE
-     * For directories, the mapping has the same numerical value.
+     * Read access. For files, this maps onto: FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_READ_EA |
+     * STANDARD_RIGHTS_READ | SYNCHRONIZE For directories, the mapping has the same numerical value.
      */
     GENERIC_READ(0x80000000, "GENERIC_READ"),
     // Access rights: 0x1f01ff: All specific + All standard
@@ -487,6 +618,7 @@ enum ACCESS_MASK implements ACCESS_MASK_DEST {
         this.desc = desc;
         destMask = BOTH;
     }
+
     private ACCESS_MASK(int i, String desc, int destMask) {
         this.mask = i;
         this.desc = desc;
@@ -504,6 +636,7 @@ enum ACCESS_MASK implements ACCESS_MASK_DEST {
         }
         return result;
     }
+
     @Override
     public String toString() {
         return desc;
